@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <iomanip>
+#include <sstream>
 #include <mutex>
 #include <ctime>
 #include "Config.hpp"
@@ -58,6 +60,7 @@ public:
     std::mutex ordersMutex;
     RateLimiter limiter;
     std::atomic<bool> stopPolling{false};
+    std::thread pollerThread;
 
     // Helper to check if current time is past the market deadline
     bool isAfterMarketDeadline() {
@@ -67,6 +70,13 @@ public:
             if (lt.tm_hour > Config::CUTOFF_HOUR || (lt.tm_hour == Config::CUTOFF_HOUR && lt.tm_min >= Config::CUTOFF_MINUTE)) return true;
         }
         return false;
+    }
+
+    // Helper to format price to 2 decimal places for API compatibility
+    std::string formatPrice(double price) {
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(2) << price;
+        return ss.str();
     }
 
     // Trade Accounting
@@ -121,11 +131,11 @@ public:
             if (orderType == "MARKET") {
                 payload["price"] = "0";
             } else {
-                payload["price"] = std::to_string(price);
+                payload["price"] = formatPrice(price);
             }
             payload["producttype"] = "CARRYFORWARD"; // Use CARRYFORWARD for Options
             payload["duration"] = "DAY";
-            if (variety == "STOPLOSS_LIMIT") payload["triggerprice"] = std::to_string(price);
+            if (variety == "STOPLOSS_LIMIT") payload["triggerprice"] = formatPrice(price);
             payload["squareoff"] = "0";
             payload["stoploss"] = "0";
             payload["quantity"] = std::to_string(quantity);
@@ -195,8 +205,8 @@ public:
             payload["ordertype"] = variety; // "STOPLOSS_LIMIT"
             payload["producttype"] = "CARRYFORWARD";
             payload["duration"] = "DAY";
-            payload["price"] = std::to_string(price + 0.05); // Limit slightly above trigger
-            payload["triggerprice"] = std::to_string(price);
+            payload["price"] = formatPrice(price + 0.05); // Limit slightly above trigger
+            payload["triggerprice"] = formatPrice(price);
             payload["quantity"] = std::to_string(quantity);
             payload["tradingsymbol"] = tradeSymbol;
             payload["symboltoken"] = tradeToken;
@@ -226,8 +236,12 @@ public:
             if (curl_easy_perform(curl) == CURLE_OK) {
                 try {
                     auto jRes = json::parse(readBuffer);
-                    if (jRes["status"].get<bool>()) res.success = true;
-                } catch (...) {}
+                    if (jRes.contains("status") && jRes["status"].is_boolean() && jRes["status"].get<bool>()) {
+                        res.success = true;
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "[ERROR] modifyOrder Parse Error: " << e.what() << std::endl;
+                }
             }
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
@@ -366,8 +380,12 @@ public:
             if (curl_easy_perform(curl) == CURLE_OK) {
                 try {
                     auto jRes = json::parse(readBuffer);
-                    if (jRes["status"].get<bool>()) res.success = true;
-                } catch (...) {}
+                    if (jRes.contains("status") && jRes["status"].is_boolean() && jRes["status"].get<bool>()) {
+                        res.success = true;
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "[ERROR] cancelOrder Parse Error: " << e.what() << std::endl;
+                }
             }
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
@@ -532,17 +550,24 @@ public:
 
     ~OrderManager() {
         stopPolling = true;
+        if (pollerThread.joinable()) {
+            pollerThread.join();
+        }
     }
 
     void startOrderBookPolling(const std::string& jwt, const std::string& key) {
-        std::thread([this, jwt, key]() {
+        if (pollerThread.joinable()) {
+            return; // Already running
+        }
+        stopPolling = false;
+        pollerThread = std::thread([this, jwt, key]() {
             while (!this->stopPolling) {
                 if (this->isTradeActive && !this->exitOrders.empty()) {
                     this->checkTradeStatus(jwt, key);
                 }
                 std::this_thread::sleep_for(std::chrono::seconds(2));
             }
-        }).detach();
+        });
     }
 
     // logic for 2-point scalp execution

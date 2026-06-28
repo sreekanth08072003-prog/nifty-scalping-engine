@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <liboath/oath.h>
 #include <cstdlib>
+#include <ctime>
 
 using json = nlohmann::json;
 
@@ -52,7 +53,12 @@ public:
 
         // 2. Generate 6-digit TOTP
         char totp_code[7];
-        oath_totp_generate(key, keylen, time(NULL), 30, 0, 6, totp_code);
+        int totp_res = oath_totp_generate(key, keylen, std::time(nullptr), 30, 0, 6, totp_code);
+        if (totp_res != OATH_OK) {
+            std::cerr << "[ERROR] TOTP generation failed!" << std::endl;
+            free(key);
+            return session;
+        }
         std::string totp = std::string(totp_code);
         
         // Free the memory allocated by oath_base32_decode
