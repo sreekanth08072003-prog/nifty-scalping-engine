@@ -1,0 +1,50 @@
+================================================================================
+                  APPLICATION ARCHITECTURE & FUNCTIONALITY
+================================================================================
+
+1. OVERVIEW
+-----------
+This is a high-frequency scalping engine designed for Angel One SmartAPI. It 
+analyzes the Nifty 50 Spot Index in real-time and executes trades in Nifty 
+Option contracts.
+
+2. COMPONENT BREAKDOWN
+----------------------
+* AngelOneLogin:   Handles secure authentication using Client ID, Password, 
+                   API Key, and TOTP Seed.
+* WebSocketClient: Establishes a secure SSL connection to the SmartAPI 
+                   SmartStream for live LTP, Volume, and OI updates.
+* StrategyEngine:  Implements Order Flow Imbalance (OFI) logic. It calculates 
+                   signal confidence based on real-time market data.
+* OrderManager:    The core execution engine. Handles:
+                    - Rate limiting (Enforcing 9 requests per second).
+                    - Order placement (Limit orders for Options).
+                    - Trailing Stop Loss logic.
+                    - Order Book Polling for fill confirmations.
+* AngelOneParser:  Binary parser for the Angel One SmartStream protocol.
+* Config:          Centralized header for manual adjustments (Lot size, Tokens).
+
+3. TRADING LOGIC (SCALP FLOW)
+-----------------------------
+1. Analysis: The engine monitors the Spot Index Token (e.g., 3045).
+2. Signal:   If a Bullish signal is detected, it triggers 'executeScalp'.
+3. Entry:    It fetches the live LTP of the target Option and places a BUY order.
+4. Management:
+    - Target: Placed at +2.0 points from entry.
+    - Stop Loss: Placed at -1.5 points from entry.
+    - Trailing: Activated when profit reachs +1.0 point. It trails the SL 
+      at 1.0 point behind the LTP.
+5. OCO:      One-Cancels-the-Other logic ensures that if the Target is hit, 
+             the SL order is automatically cancelled, and vice-versa.
+
+4. RISK CONTROLS
+----------------
+* Daily PnL: The application blocks new entries if the Max Daily Loss (-2500) 
+  or Max Daily Profit (+6500) is reached.
+* Timeouts: If an entry order isn't filled within 30 seconds, it is cancelled.
+* Position Timeout: Any active position is force-closed after 10 minutes to 
+  prevent being trapped in illiquid moves.
+* Rate Limiting: Prevents account blocking by ensuring API calls stay within 
+  exchange-allowed limits.
+
+================================================================================

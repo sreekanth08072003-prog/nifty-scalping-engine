@@ -1,0 +1,45 @@
+================================================================================
+                  AUTO-TRADING APPLICATION COMMAND GUIDE
+================================================================================
+
+1. INITIAL SETUP (Run once)
+---------------------------
+To install all required C++ libraries (Boost, SSL, CURL, etc.):
+    chmod +x setup.sh
+    ./setup.sh
+
+2. RUNNING THE APPLICATION
+---------------------------
+Standard Execution (Foreground):
+    chmod +x run.sh
+    ./run.sh
+
+Running in Background (Cloud/Server mode):
+    sudo systemctl start trading_app
+
+Viewing Live Logs (If running as a service):
+    journalctl -u trading_app -f
+
+3. STOPPING THE APPLICATION
+---------------------------
+If running in terminal:
+    Press 'Ctrl + C'
+
+If running as a background service:
+    sudo systemctl stop trading_app
+
+Emergency Kill (Force stop all instances):
+    pkill -9 trading_app
+
+4. CONFIGURATION
+---------------------------
+To change lot sizes, option tokens, or index tokens, modify the following file
+and then run ./run.sh again to recompile:
+    include/Config.hpp
+
+5. MAINTENANCE
+---------------------------
+To check if the application is currently running:
+    pgrep -l trading_app
+
+================================================================================

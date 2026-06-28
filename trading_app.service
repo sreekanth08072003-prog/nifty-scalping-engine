@@ -1,0 +1,14 @@
+[Unit]
+Description=AngelOne Auto Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=sreekanth08072003
+WorkingDirectory=/home/sreekanth08072003/auto-trading-app/build
+ExecStart=/home/sreekanth08072003/auto-trading-app/build/trading_app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
