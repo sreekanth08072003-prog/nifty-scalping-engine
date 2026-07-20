@@ -120,8 +120,9 @@ public:
     }
 
     static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-        ((std::string*)userp)->append((char*)contents, size * nmemb);
-        return size * nmemb;
+        size_t totalSize = size * nmemb;
+        static_cast<std::string*>(userp)->append(static_cast<char*>(contents), totalSize);
+        return totalSize;
     }
 
     // Private helper to handle all Angel One API communication
