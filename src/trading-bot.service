@@ -1,0 +1,18 @@
+[Unit]
+Description=Angel One Auto-Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=sreekanth08072003
+WorkingDirectory=/home/sreekanth08072003/auto-trading-app
+EnvironmentFile=/home/sreekanth08072003/auto-trading-app/.env
+ExecStart=/home/sreekanth08072003/auto-trading-app/build/trading_engine
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+StandardOutput=append:/home/sreekanth08072003/auto-trading-app/trading-bot.log
+StandardError=append:/home/sreekanth08072003/auto-trading-app/trading-bot.log
+
+[Install]
+WantedBy=multi-user.target

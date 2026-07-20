@@ -1,92 +1,62 @@
 #ifndef STRATEGY_ENGINE_HPP
 #define STRATEGY_ENGINE_HPP
+
 #include "MarketData.hpp"
+#include <map>
+#include <iostream>
 #include <cmath>
-#include <vector>
-#include <deque>
-#include <numeric>
+#include "OrderManager.hpp"
+#include "Config.hpp"
 
 class StrategyEngine {
 private:
-    std::deque<long long> volumeWindow;
-    const size_t WINDOW_SIZE = 20; // Last 20 ticks
-    double prevLtp = 0.0;
+    struct SymbolState {
+        double lastPrice = 0.0;
+        double ofiAccumulator = 0.0;
+    };
+    std::map<std::string, SymbolState> states;
 
 public:
-    struct ScalpSignal {
-        bool buyCall = false;
-        bool buyPut = false;
-        double confidence = 0.0;
-    };
+    void onTick(const MarketData& md, OrderManager& om, const std::string& jwt, const std::string& apiKey) {
+        auto& state = states[md.token];
 
-    // Advanced Math: Z-Score of Order Flow Imbalance
-    ScalpSignal analyzeOrderFlow(const MarketData& md) {
-        ScalpSignal signal;
+        // Log every tick for visibility
+        om.logTick(md.token, md.ltp, static_cast<int>(md.lastTradeQty));
+
+        if (state.lastPrice > 0) {
+            // Momentum Logic: Price movement * Volume impact
+            double priceChange = md.ltp - state.lastPrice;
+            
+            if (priceChange > 0) {
+                state.ofiAccumulator += md.lastTradeQty;
+            } else if (priceChange < 0) {
+                state.ofiAccumulator -= md.lastTradeQty;
+            }
+            
+            if (std::abs(state.ofiAccumulator) > (Config::OFI_THRESHOLD / 3.0)) {
+                std::cout << "[DEBUG] OFI Accumulator for " << md.token << ": " << state.ofiAccumulator << std::endl;
+            }
+
+            // 1. Update Trailing SL if this tick belongs to our active position
+            if (om.isTradeActive && md.token == om.tradeToken) {
+                om.updateTrailingSL(md.ltp, jwt, apiKey);
+            }
+
+            // 2. Trigger Entry if momentum exceeds threshold (1500 qty imbalance)
+            if (!om.isTradeActive && state.ofiAccumulator > Config::OFI_THRESHOLD) {
+                if (md.token == Config::CALL_OPTION_TOKEN) {
+                    std::cout << "[SIGNAL] Bullish Momentum! Buying Call: " << Config::CALL_OPTION_SYMBOL << std::endl;
+                    om.executeScalp(jwt, apiKey, md.token, Config::CALL_OPTION_SYMBOL, Config::LOT_SIZE, md.ltp);
+                    state.ofiAccumulator = 0; // Reset after trigger
+                } else if (md.token == Config::PUT_OPTION_TOKEN) {
+                    std::cout << "[SIGNAL] Bearish Momentum! Buying Put: " << Config::PUT_OPTION_SYMBOL << std::endl;
+                    om.executeScalp(jwt, apiKey, md.token, Config::PUT_OPTION_SYMBOL, Config::LOT_SIZE, md.ltp);
+                    state.ofiAccumulator = 0; // Reset after trigger
+                }
+            }
+        }
         
-        // 1. Calculate Imbalance (Aggressor Volume)
-        long long currentImbalance = 0;
-        if (md.ltp > prevLtp) currentImbalance = md.lastTradeQty;
-        else if (md.ltp < prevLtp) currentImbalance = -md.lastTradeQty;
-        
-        prevLtp = md.ltp;
-        volumeWindow.push_back(currentImbalance);
-        if (volumeWindow.size() > WINDOW_SIZE) volumeWindow.pop_front();
-
-        if (volumeWindow.size() < WINDOW_SIZE) return signal;
-
-        // 2. Statistical Metrics
-        double sum = std::accumulate(volumeWindow.begin(), volumeWindow.end(), 0.0);
-        double mean = sum / WINDOW_SIZE;
-        double sq_sum = std::inner_product(volumeWindow.begin(), volumeWindow.end(), volumeWindow.begin(), 0.0);
-        double stdev = std::sqrt(sq_sum / WINDOW_SIZE - mean * mean);
-
-        // 3. Z-Score Calculation
-        double zScore = (currentImbalance - mean) / (stdev + 0.0001);
-        signal.confidence = std::abs(zScore);
-
-        // Trigger if momentum is 2 standard deviations away from mean
-        if (zScore > 2.0) signal.buyCall = true;
-        else if (zScore < -2.0) signal.buyPut = true;
-
-        return signal;
-    }
-
-    // Delta Calculation to find "Cheap Options" (Target Delta ~ 0.1)
-    double calculateDelta(double S, double K, double T, double r, double sigma, bool isCall) {
-        if (S <= 0 || K <= 0 || sigma <= 0 || T <= 0) {
-            return 0.0;
-        }
-
-        double d1 = (std::log(S / K) + (r + (sigma * sigma) / 2.0) * T) / (sigma * std::sqrt(T));
-        if (isCall) {
-            return 0.5 * std::erfc(-d1 * 0.70710678118);
-        } else {
-            return (0.5 * std::erfc(-d1 * 0.70710678118)) - 1.0;
-        }
-    }
-
-    bool isIdealScalpingDelta(double delta) {
-        // Target options moving 1 point for every 10 point Nifty move (Delta 0.1)
-        return std::abs(delta) >= 0.08 && std::abs(delta) <= 0.12;
-    }
-
-    double solveIV(double target, double S, double K, double T, double r) {
-        double sigma = 0.5; // Initial guess
-        for (int i = 0; i < 10; ++i) {
-            double d1 = (std::log(S / K) + (r + (sigma * sigma) / 2.0) * T) / (sigma * std::sqrt(T));
-            double d2 = d1 - sigma * std::sqrt(T);
-            
-            // Black-Scholes Call Price
-            double price = S * (0.5 * std::erfc(-d1 * 0.70710678118)) - K * std::exp(-r * T) * (0.5 * std::erfc(-d2 * 0.70710678118));
-            
-            double diff = target - price;
-            if (std::abs(diff) < 0.01) return sigma;
-            
-            // Vega calculation
-            double v = S * std::sqrt(T) * (std::exp(-d1 * d1 / 2.0) / 2.50662827463);
-            sigma += diff / (v + 0.0001); // Update sigma
-        }
-        return sigma;
+        state.lastPrice = md.ltp;
     }
 };
 #endif

@@ -23,9 +23,11 @@ private:
     std::deque<std::chrono::steady_clock::time_point> request_timestamps;
     const int MAX_REQUESTS = 9;
     const std::chrono::milliseconds WINDOW = std::chrono::milliseconds(1000);
+    std::mutex mtx; // Protects request_timestamps
 
 public:
     void wait() {
+        std::lock_guard<std::mutex> lock(mtx);
         auto now = std::chrono::steady_clock::now();
         while (!request_timestamps.empty() && (now - request_timestamps.front() > WINDOW)) {
             request_timestamps.pop_front();
@@ -72,10 +74,24 @@ public:
         return false;
     }
 
+    // Helper to log tick-by-tick data for Nifty or active trades
+    void logTick(const std::string& symbol, double ltp, int volume) {
+        std::string displayName = symbol;
+        // Map token to human-readable symbol for better visibility
+        if (symbol == Config::CALL_OPTION_TOKEN) displayName = Config::CALL_OPTION_SYMBOL;
+        else if (symbol == Config::PUT_OPTION_TOKEN) displayName = Config::PUT_OPTION_SYMBOL;
+
+        std::cout << "[TICK] " << std::left << std::setw(20) << displayName 
+                  << " | LTP: " << std::fixed << std::setprecision(2) << std::setw(8) << ltp 
+                  << " | Qty: " << volume << std::endl;
+    }
+
     // Helper to format price to 2 decimal places for API compatibility
     std::string formatPrice(double price) {
+        // Round to nearest 0.05 (NFO Tick Size)
+        double rounded = std::round(price * 20.0) / 20.0;
         std::stringstream ss;
-        ss << std::fixed << std::setprecision(2) << price;
+        ss << std::fixed << std::setprecision(2) << rounded;
         return ss.str();
     }
 
@@ -108,85 +124,79 @@ public:
         return size * nmemb;
     }
 
+    // Private helper to handle all Angel One API communication
+    json performApiRequest(const std::string& url, const std::string& jwt, const std::string& key, const json& payload = json::object(), bool isPost = true) {
+        limiter.wait();
+        std::string readBuffer;
+        CURL* curl = curl_easy_init();
+        json result = json::object();
+
+        if (curl) {
+            struct curl_slist* headers = NULL;
+            headers = curl_slist_append(headers, "Content-Type: application/json");
+            headers = curl_slist_append(headers, ("Authorization: Bearer " + sanitize(jwt)).c_str());
+            headers = curl_slist_append(headers, ("X-PrivateKey: " + sanitize(key)).c_str());
+            headers = curl_slist_append(headers, "X-UserType: USER");
+            headers = curl_slist_append(headers, "X-SourceID: WEB");
+            headers = curl_slist_append(headers, ("X-ClientLocalIP: " + localIP).c_str());
+            headers = curl_slist_append(headers, ("X-ClientPublicIP: " + publicIP).c_str());
+            headers = curl_slist_append(headers, "X-MACAddress: 02:00:00:00:00:00");
+            headers = curl_slist_append(headers, "Accept: application/json");
+
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+
+            std::string data;
+            if (isPost && !payload.empty()) {
+                data = payload.dump();
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+            }
+
+            if (curl_easy_perform(curl) == CURLE_OK) {
+                try {
+                    if (readBuffer.find("<html") == std::string::npos) {
+                        result = json::parse(readBuffer);
+                    }
+                } catch (...) {
+                    std::cerr << "[ERROR] JSON Parse Error at " << url << std::endl;
+                }
+            }
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+        }
+        return result;
+    }
+
     OrderResponse placeOrder(const std::string& jwtToken, const std::string& apiKey,
                             const std::string& symbolToken, const std::string& tradingSymbol,
                             int quantity, double price, const std::string& transactionType,
                             const std::string& variety = "NORMAL",
                             const std::string& orderType = "LIMIT") {
         
-        limiter.wait(); // Enforce 9 req/sec limit
-
         OrderResponse res = {false, "", ""};
-        CURL* curl = curl_easy_init();
+        json payload;
+        payload["variety"] = variety;
+        payload["tradingsymbol"] = tradingSymbol;
+        payload["symboltoken"] = symbolToken;
+        payload["transactiontype"] = transactionType;
+        payload["exchange"] = "NFO";
+        payload["ordertype"] = orderType;
+        payload["price"] = (orderType == "MARKET") ? "0" : formatPrice(price);
+        payload["producttype"] = "CARRYFORWARD";
+        payload["duration"] = "DAY";
+        payload["quantity"] = std::to_string(quantity);
 
-        if (curl) {
-            std::string readBuffer;
-            json payload;
-            payload["variety"] = variety;
-            payload["tradingsymbol"] = tradingSymbol;
-            payload["symboltoken"] = symbolToken;
-            payload["transactiontype"] = transactionType; // "BUY" or "SELL"
-            payload["exchange"] = "NFO";
-            payload["ordertype"] = orderType;
-            if (orderType == "MARKET") {
-                payload["price"] = "0";
-            } else {
-                payload["price"] = formatPrice(price);
-            }
-            payload["producttype"] = "CARRYFORWARD"; // Use CARRYFORWARD for Options
-            payload["duration"] = "DAY";
-            if (variety == "STOPLOSS_LIMIT") payload["triggerprice"] = formatPrice(price);
-            payload["squareoff"] = "0";
-            payload["stoploss"] = "0";
-            payload["quantity"] = std::to_string(quantity);
+        auto jRes = performApiRequest("https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/placeOrder", jwtToken, apiKey, payload);
 
-            std::string data = payload.dump();
-            struct curl_slist* headers = NULL;
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-            headers = curl_slist_append(headers, ("Authorization: Bearer " + sanitize(jwtToken)).c_str());
-            headers = curl_slist_append(headers, ("X-PrivateKey: " + sanitize(apiKey)).c_str());
-            headers = curl_slist_append(headers, "X-UserType: USER");
-            headers = curl_slist_append(headers, "X-SourceID: WEB");
-            headers = curl_slist_append(headers, ("X-ClientLocalIP: " + localIP).c_str());
-            headers = curl_slist_append(headers, ("X-ClientPublicIP: " + publicIP).c_str());
-            headers = curl_slist_append(headers, "X-MACAddress: 02:00:00:00:00:00");
-            headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-            headers = curl_slist_append(headers, "Accept: application/json");
-            headers = curl_slist_append(headers, "Expect:"); // Disable Expect: 100-continue
-
-            curl_easy_setopt(curl, CURLOPT_URL, "https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/placeOrder");
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data.length());
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-
-            if (curl_easy_perform(curl) == CURLE_OK) {
-                long response_code;
-                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-                
-                try {
-                    if (readBuffer.find("<html") != std::string::npos) {
-                        throw std::runtime_error("Server returned HTML instead of JSON. Check IP/Headers.");
-                    }
-
-                    auto jRes = json::parse(readBuffer);
-                    if (jRes["status"].get<bool>()) {
-                        res.success = true;
-                        res.orderId = jRes["data"]["orderid"];
-                        std::cout << "[ORDER] Successfully submitted " << transactionType 
-                                  << " order for " << quantity << " qty. ID: " << res.orderId << std::endl;
-                    } else {
-                        res.message = jRes["message"];
-                        std::cerr << "[ERROR] Order failed: " << res.message << std::endl;
-                    }
-                } catch (const std::exception& e) {
-                    std::cerr << "[ERROR] placeOrder JSON Parse error (HTTP " << response_code << "): " 
-                              << e.what() << ". Body: " << readBuffer.substr(0, 100) << "..." << std::endl;
-                }
-            }
-            curl_slist_free_all(headers);
-            curl_easy_cleanup(curl);
+        if (!jRes.empty() && jRes.contains("data") && !jRes["data"].is_null()) {
+            res.success = true;
+            res.orderId = jRes["data"]["orderid"];
+            std::cout << "[ORDER_SUBMITTED] " << transactionType << " | Symbol: " << tradingSymbol << " | ID: " << res.orderId << std::endl;
+        } else if (jRes.contains("message")) {
+            res.message = jRes["message"];
+            std::cerr << "[ORDER_FAILED] Reason: " << res.message << std::endl;
         }
         return res;
     }
@@ -194,57 +204,23 @@ public:
     OrderResponse modifyOrder(const std::string& jwtToken, const std::string& apiKey,
                              const std::string& orderId, int quantity, double price,
                              const std::string& variety) {
-        limiter.wait();
         OrderResponse res = {false, "", ""};
-        CURL* curl = curl_easy_init();
-        if (curl) {
-            std::string readBuffer;
-            json payload;
-            payload["variety"] = variety;
-            payload["orderid"] = orderId;
-            payload["ordertype"] = variety; // "STOPLOSS_LIMIT"
-            payload["producttype"] = "CARRYFORWARD";
-            payload["duration"] = "DAY";
-            payload["price"] = formatPrice(price + 0.05); // Limit slightly above trigger
-            payload["triggerprice"] = formatPrice(price);
-            payload["quantity"] = std::to_string(quantity);
-            payload["tradingsymbol"] = tradeSymbol;
-            payload["symboltoken"] = tradeToken;
-            payload["exchange"] = "NFO";
+        json payload;
+        payload["variety"] = variety;
+        payload["orderid"] = orderId;
+        payload["ordertype"] = variety;
+        payload["producttype"] = "CARRYFORWARD";
+        payload["duration"] = "DAY";
+        payload["price"] = formatPrice(price - 0.05);
+        payload["triggerprice"] = formatPrice(price);
+        payload["quantity"] = std::to_string(quantity);
+        payload["tradingsymbol"] = tradeSymbol;
+        payload["symboltoken"] = tradeToken;
+        payload["exchange"] = "NFO";
 
-            std::string data = payload.dump();
-            struct curl_slist* headers = NULL;
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-            headers = curl_slist_append(headers, ("Authorization: Bearer " + sanitize(jwtToken)).c_str());
-            headers = curl_slist_append(headers, ("X-PrivateKey: " + sanitize(apiKey)).c_str());
-            headers = curl_slist_append(headers, "X-UserType: USER");
-            headers = curl_slist_append(headers, "X-SourceID: WEB");
-            headers = curl_slist_append(headers, ("X-ClientLocalIP: " + localIP).c_str());
-            headers = curl_slist_append(headers, ("X-ClientPublicIP: " + publicIP).c_str());
-            headers = curl_slist_append(headers, "X-MACAddress: 02:00:00:00:00:00");
-            headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-            headers = curl_slist_append(headers, "Accept: application/json");
-            headers = curl_slist_append(headers, "Expect:");
-
-            curl_easy_setopt(curl, CURLOPT_URL, "https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/modifyOrder");
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data.length());
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-
-            if (curl_easy_perform(curl) == CURLE_OK) {
-                try {
-                    auto jRes = json::parse(readBuffer);
-                    if (jRes.contains("status") && jRes["status"].is_boolean() && jRes["status"].get<bool>()) {
-                        res.success = true;
-                    }
-                } catch (const std::exception& e) {
-                    std::cerr << "[ERROR] modifyOrder Parse Error: " << e.what() << std::endl;
-                }
-            }
-            curl_slist_free_all(headers);
-            curl_easy_cleanup(curl);
+        auto jRes = performApiRequest("https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/modifyOrder", jwtToken, apiKey, payload);
+        if (!jRes.empty() && jRes.contains("status") && jRes["status"].get<bool>()) {
+            res.success = true;
         }
         return res;
     }
@@ -285,17 +261,40 @@ public:
     double getLtp(const std::string& jwtToken, const std::string& apiKey,
                   const std::string& exchange, const std::string& tradingSymbol,
                   const std::string& symbolToken) {
-        limiter.wait();
         double ltp = 0.0;
+        json payload;
+        payload["exchange"] = exchange;
+        payload["tradingsymbol"] = tradingSymbol;
+        payload["symboltoken"] = symbolToken;
+
+        auto jRes = performApiRequest("https://apiconnect.angelone.in/order-service/rest/secure/angelbroking/order/v1/getLtpData", jwtToken, apiKey, payload);
+        if (!jRes.empty() && jRes.contains("status") && jRes["status"].get<bool>()) {
+            ltp = jRes["data"]["ltp"].get<double>();
+        }
+        return ltp;
+    }
+
+    json estimateCharges(const std::string& jwtToken, const std::string& apiKey,
+                        const std::string& tradingSymbol, int quantity, double price,
+                        const std::string& transactionType) {
+        limiter.wait();
+        json result;
         CURL* curl = curl_easy_init();
         if (curl) {
             std::string readBuffer;
-            json payload;
-            payload["exchange"] = exchange;
-            payload["tradingsymbol"] = tradingSymbol;
-            payload["symboltoken"] = symbolToken;
-            std::string data = payload.dump();
+            
+            json order;
+            order["exchange"] = "NFO";
+            order["tradingsymbol"] = tradingSymbol;
+            order["transactiontype"] = transactionType;
+            order["quantity"] = quantity;
+            order["price"] = formatPrice(price);
+            order["producttype"] = "CARRYFORWARD";
 
+            json payload;
+            payload["orders"] = json::array({order});
+            
+            std::string data = payload.dump();
             struct curl_slist* headers = NULL;
             headers = curl_slist_append(headers, "Content-Type: application/json");
             headers = curl_slist_append(headers, ("Authorization: Bearer " + sanitize(jwtToken)).c_str());
@@ -309,7 +308,7 @@ public:
             headers = curl_slist_append(headers, "Accept: application/json");
             headers = curl_slist_append(headers, "Expect:");
 
-            curl_easy_setopt(curl, CURLOPT_URL, "https://apiconnect.angelone.in/order-service/rest/secure/angelbroking/order/v1/getLtpData");
+            curl_easy_setopt(curl, CURLOPT_URL, "https://apiconnect.angelone.in/rest/secure/angelbroking/brokerage/v1/estimateCharges");
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
             curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data.length());
@@ -319,30 +318,23 @@ public:
             if (curl_easy_perform(curl) == CURLE_OK) {
                 long response_code;
                 curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
                 try {
-                    if (readBuffer.find("<html") != std::string::npos) {
-                        throw std::runtime_error("Server returned HTML instead of JSON.");
-                    }
-
                     if (response_code == 200) {
                         auto jRes = json::parse(readBuffer);
                         if (jRes["status"].get<bool>()) {
-                            ltp = jRes["data"]["ltp"].get<double>();
+                            result = jRes["data"];
                         } else {
-                            std::cerr << "[ERROR] getLtp failed: " << jRes["message"] << std::endl;
+                            std::cerr << "[ERROR] estimateCharges failed: " << jRes["message"] << std::endl;
                         }
-                    } else {
-                        std::cerr << "[ERROR] getLtp HTTP Code " << response_code << ". Body: " << readBuffer.substr(0, 50) << "..." << std::endl;
                     }
                 } catch (const std::exception& e) {
-                    std::cerr << "[ERROR] getLtp JSON Parse error: " << e.what() << ". Body: " << readBuffer.substr(0, 100) << "..." << std::endl;
+                    std::cerr << "[ERROR] estimateCharges JSON Parse error: " << e.what() << std::endl;
                 }
             }
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
         }
-        return ltp;
+        return result;
     }
 
     OrderResponse cancelOrder(const std::string& jwtToken, const std::string& apiKey,
@@ -439,9 +431,13 @@ public:
                                 
                                 if (currentStage == TradeStage::ENTRY_PENDING && ao["status"] == "complete") {
                                     actualEntryPrice = std::stod(ao["averageprice"].get<std::string>());
-                                    std::cout << "[POLLER] Entry Filled at " << actualEntryPrice << ". Placing Exits..." << std::endl;
+                                    std::cout << "[TRADE_LOG][ENTRY_FILLED] Symbol: " << tradeSymbol << " | Price: " << actualEntryPrice << " | Qty: " << actualQuantityFilled << std::endl;
                                     currentStage = TradeStage::EXIT_PENDING;
                                     placeExitOrders(jwtToken, apiKey, actualEntryPrice);
+                                } else if (currentStage == TradeStage::ENTRY_PENDING && (ao["status"] == "rejected" || ao["status"] == "cancelled")) {
+                                    std::cerr << "[TRADE_LOG][ORDER_FAILED] Type: ENTRY | Status: " << ao["status"].get<std::string>() << " | Reason: " << (ao.contains("text") ? ao["text"].get<std::string>() : "Unknown") << std::endl;
+                                    isTradeActive = false;
+                                    currentStage = TradeStage::NONE;
                                 }
                                 break;
                             }
@@ -503,8 +499,13 @@ public:
                             for (const auto& eo : exitOrders) {
                                 for (const auto& ao : jRes["data"]) {
                                     if (ao["orderid"] == eo.orderId && ao["status"] == "complete") {
-                                        std::cout << "[POLLER] Exit Order " << eo.orderId 
-                                                  << " FILLED. Qty: " << ao["filledshares"] << std::endl;
+                                        double exitPrice = std::stod(ao["averageprice"].get<std::string>());
+                                        std::cout << "[TRADE_LOG][EXIT_FILLED] Symbol: " << tradeSymbol << " | Price: " << exitPrice << " | Qty: " << ao["filledshares"] << std::endl;
+                                        double tradePnL = (exitPrice - actualEntryPrice) * actualQuantityFilled;
+                                        dailyPnL += tradePnL;
+                                        
+                                        std::cout << "[TRADE_LOG][EXIT_FILLED] Symbol: " << tradeSymbol << " | Price: " << exitPrice << " | PnL: " << tradePnL << " | Total: " << dailyPnL << std::endl;
+                                        
                                         anyFilled = true;
                                         break;
                                     }
@@ -562,7 +563,7 @@ public:
         stopPolling = false;
         pollerThread = std::thread([this, jwt, key]() {
             while (!this->stopPolling) {
-                if (this->isTradeActive && !this->exitOrders.empty()) {
+                if (this->isTradeActive) {
                     this->checkTradeStatus(jwt, key);
                 }
                 std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -571,7 +572,7 @@ public:
     }
 
     // logic for 2-point scalp execution
-    void executeScalp(const std::string& jwt, const std::string& key, const std::string& token, const std::string& symbol, int quantity) {
+    void executeScalp(const std::string& jwt, const std::string& key, const std::string& token, const std::string& symbol, int quantity, double entryPrice) {
         if (isTradeActive) return;
 
         // Block entry after 14:30 IST
@@ -590,21 +591,13 @@ public:
             return;
         }
         
-        // Fetch the actual LTP for the Option contract specifically from NFO
-        // We do this because the price from the Spot stream isn't the Option price.
-        double optionLtp = getLtp(jwt, key, "NFO", symbol, token);
-        if (optionLtp <= 0) {
-            std::cerr << "[ERROR] Could not fetch LTP for " << symbol << ". Order aborted." << std::endl;
-            return;
-        }
-
         isTradeActive = true;
         currentStage = TradeStage::ENTRY_PENDING;
         tradeSymbol = symbol;
         tradeToken = token;
         entryPlacementTime = std::chrono::steady_clock::now();
 
-        auto entry = placeOrder(jwt, key, token, symbol, quantity, optionLtp, "BUY");
+        auto entry = placeOrder(jwt, key, token, symbol, quantity, entryPrice, "BUY");
         if(entry.success) {
             activeEntryId = entry.orderId;
             std::cout << "[SCALP] Entry Submitted. Waiting for full fill..." << std::endl;
@@ -614,4 +607,5 @@ public:
         }
     }
 };
+
 #endif

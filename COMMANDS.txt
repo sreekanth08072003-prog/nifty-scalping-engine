@@ -11,8 +11,12 @@ To install all required C++ libraries (Boost, SSL, CURL, etc.):
 2. RUNNING THE APPLICATION
 ---------------------------
 Standard Execution (Foreground):
-    chmod +x run.sh
-    ./run.sh
+    # 1. Load Environment (using your specific env file)
+    export $(grep -v '^#' trading.env | xargs)
+
+    # 2. Compile (Linking curl, ssl, boost_system, and crypto is required)
+    g++ -std=c++17 -O3 -Iinclude src/main.cpp -o trading_engine -lcurl -lssl -lcrypto -lboost_system -lpthread
+    ./trading_engine
 
 Running in Background (Cloud/Server mode):
     sudo systemctl start trading_app

@@ -5,6 +5,7 @@ After=network.target
 [Service]
 Type=simple
 User=sreekanth08072003
+EnvironmentFile=/home/sreekanth08072003/auto-trading-app/trading.env
 WorkingDirectory=/home/sreekanth08072003/auto-trading-app/build
 ExecStart=/home/sreekanth08072003/auto-trading-app/build/trading_app
 Restart=always

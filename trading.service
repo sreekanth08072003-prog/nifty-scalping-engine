@@ -1,0 +1,15 @@
+[Unit]
+Description=Angel One Auto Trading Engine
+After=network.target
+
+[Service]
+Type=simple
+User=sreekanth08072003
+WorkingDirectory=/home/sreekanth08072003/auto-trading-app
+EnvironmentFile=/home/sreekanth08072003/auto-trading-app/.env
+ExecStart=/home/sreekanth08072003/auto-trading-app/build/trading_engine
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

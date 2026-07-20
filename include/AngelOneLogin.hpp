@@ -5,9 +5,13 @@
 #include <string>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
-#include <liboath/oath.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 #include <cstdlib>
 #include <ctime>
+#include <vector>
+#include <cmath>
+#include <cctype>
 
 using json = nlohmann::json;
 
@@ -15,6 +19,49 @@ class AngelOneLogin {
 private:
     std::string publicIP;
     std::string localIP;
+
+    // Internal Base32 decoder to remove liboath dependency
+    std::vector<uint8_t> base32_decode(const std::string& input) {
+        static const std::string base32_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        std::vector<uint8_t> out;
+        uint32_t buffer = 0;
+        int bitsLeft = 0;
+        for (char c : input) {
+            if (std::isspace(static_cast<unsigned char>(c))) continue;
+            auto val = base32_chars.find(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+            if (val == std::string::npos) continue;
+            buffer = (buffer << 5) | (val & 0x1F);
+            bitsLeft += 5;
+            if (bitsLeft >= 8) {
+                out.push_back(static_cast<uint8_t>((buffer >> (bitsLeft - 8)) & 0xFF));
+                bitsLeft -= 8;
+            }
+        }
+        return out;
+    }
+
+    // Internal TOTP generator using OpenSSL (already required for WebSockets)
+    std::string generateTOTP(const std::string& seed) {
+        auto key = base32_decode(seed);
+        uint64_t timer = std::time(nullptr) / 30;
+        uint8_t data[8];
+        for (int i = 7; i >= 0; i--) {
+            data[i] = timer & 0xFF;
+            timer >>= 8;
+        }
+
+        unsigned int len = 20;
+        unsigned char hash[20];
+        HMAC(EVP_sha1(), key.data(), key.size(), data, 8, hash, &len);
+
+        int offset = hash[19] & 0x0F;
+        uint32_t truncatedHash = (hash[offset] & 0x7F) << 24 | (hash[offset + 1] & 0xFF) << 16 | (hash[offset + 2] & 0xFF) << 8 | (hash[offset + 3] & 0xFF);
+        
+        uint32_t pin = truncatedHash % 1000000;
+        std::string res = std::to_string(pin);
+        while (res.length() < 6) res = "0" + res;
+        return res;
+    }
 
 public:
     AngelOneLogin(const std::string& pubIP, const std::string& locIP) : publicIP(pubIP), localIP(locIP) {}
@@ -41,29 +88,8 @@ public:
         
         std::cout << "[INFO] Detected Public IP for Login: " << publicIP << std::endl;
 
-        // 1. Correctly decode Base32 Seed
-        char *key = nullptr;
-        size_t keylen = 0;
-        int decode_res = oath_base32_decode(seed.c_str(), seed.length(), &key, &keylen);
-        
-        if (decode_res != OATH_OK) {
-            std::cerr << "[ERROR] Base32 decoding failed!" << std::endl;
-            return session;
-        }
-
-        // 2. Generate 6-digit TOTP
-        char totp_code[7];
-        int totp_res = oath_totp_generate(key, keylen, std::time(nullptr), 30, 0, 6, totp_code);
-        if (totp_res != OATH_OK) {
-            std::cerr << "[ERROR] TOTP generation failed!" << std::endl;
-            free(key);
-            return session;
-        }
-        std::string totp = std::string(totp_code);
-        
-        // Free the memory allocated by oath_base32_decode
-        free(key);
-        
+        // Generate 6-digit TOTP internally using OpenSSL
+        std::string totp = generateTOTP(seed);
         std::cout << "[DEBUG] Generated TOTP: " << totp << std::endl;
 
         // 3. Perform REST API Login
@@ -98,11 +124,20 @@ public:
                 std::cout << "[DEBUG] Server Response: " << readBuffer << std::endl;
                 try {
                     auto response = json::parse(readBuffer);
-                    if(response.contains("status") && response["status"].get<bool>()) {
+                    bool isOk = (response.contains("status") && response["status"].is_boolean() && response["status"].get<bool>()) ||
+                               (response.contains("success") && response["success"].is_boolean() && response["success"].get<bool>());
+                    
+                    if(isOk) {
                         session.jwtToken = response["data"]["jwtToken"];
                         session.feedToken = response["data"]["feedToken"];
                         session.success = true;
+                    } else {
+                        std::string msg = response.contains("message") ? response["message"].get<std::string>() : "Unknown Error";
+                        std::cerr << "[LOGIN] API Error: " << msg << std::endl;
                     }
+                } catch (const json::parse_error& e) {
+                    std::cerr << "[ERROR] JSON Parse Error: " << e.what() << std::endl;
+                    std::cerr << "[ERROR] Raw Body: " << readBuffer << std::endl;
                 } catch (...) {
                     std::cerr << "[ERROR] Failed to parse JSON response." << std::endl;
                 }
